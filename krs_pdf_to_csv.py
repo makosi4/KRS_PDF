@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KRS PDF to CSV Converter - v3.0 (Kompletna Wersja)
+KRS PDF to CSV Converter - v3.1 (Poprawiona Wersja)
 Aplikacja do konwersji plików PDF z KRS na ustrukturyzowane pliki CSV
 Ekstrahuje wszystkie kategorie danych: wspólnicy, kierownictwo, adresy, prokurenci, etc.
 """
@@ -40,8 +40,7 @@ class KRSPDFExtractor:
             'organy_nadzoru': [],
             'prokurenci': [],
             'przedmiot_dzialalnosci': [],
-            'zestawienie_zmian': [],
-            'zestawienie_dokumentow': []
+            'zestawienie_zmian': []
         }
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
@@ -65,16 +64,19 @@ class KRSPDFExtractor:
     
     def extract_company_name(self, text: str) -> str:
         """Wyciąga nazwę firmy (Firma, pod którą spółka działa)"""
-        match = re.search(r'3\.Firma, pod którą spółka działa\s+(\d+)-(.*?)(?=\n[0-9]\.|\Z)', text, re.DOTALL)
+        # Szuka "3.Firma, pod którą spółka działa" w Rubryce 1
+        pattern = r'3\.Firma,\s*pod którą spółka działa\s+\d+-(.+?)(?=\n\d\.|Dane o wcześniejszej|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
         if match:
-            return match.group(2).strip()
+            return match.group(1).strip()
         return ""
     
     def extract_legal_form(self, text: str) -> str:
         """Wyciąga formę prawną"""
-        match = re.search(r'1\.Oznaczenie formy prawnej\s+(\d+)-(.*?)(?=\n[0-9]\.|\Z)', text, re.DOTALL)
+        pattern = r'1\.Oznaczenie formy prawnej\s+\d+-(.+?)(?=\n\d\.|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
         if match:
-            return match.group(2).strip()
+            return match.group(1).strip()
         return ""
     
     def extract_regon_nip(self, text: str) -> Tuple[str, str]:
@@ -82,71 +84,99 @@ class KRSPDFExtractor:
         regon = ""
         nip = ""
         
-        match = re.search(r'2\.Numer REGON/NIP.*?REGON:\s*([\d-]+).*?NIP:\s*([\d]+)', text, re.DOTALL)
-        if match:
-            regon = match.group(1).strip()
-            nip = match.group(2).strip()
+        # Szuka całej sekcji REGON/NIP
+        pattern = r'2\.Numer REGON/NIP\s+\d+-REGON:\s*([^,]+),\s*NIP:\s*(.+?)(?=\n\d\.|\Z)'
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        if matches:
+            # Bierze ostatni (najnowszy wpis)
+            last_match = matches[-1]
+            regon = last_match[0].strip()
+            nip = last_match[1].strip()
         
         return regon, nip
     
     def extract_siedziby_adresy(self, text: str) -> List[Dict]:
-        """Wyciąga siedziby i adresy"""
+        """Wyciąga siedziby i adresy z Rubryki 2"""
         adresy = []
         
-        # Szuka sekcji Siedziba i adres
-        pattern = r'Rubryka 2\s+Siedziba i adres podmiotu(.*?)(?=Rubryka 3|Dział 2|\Z)'
+        # Szuka sekcji Rubryka 2
+        pattern = r'Rubryka 2\s+Siedziba i adres podmiotu(.*?)(?=Rubryka 3|Oddziały|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
+        if not match:
+            return adresy
+        
+        section = match.group(1)
+        
+        # Szuka pól z numerami wpisów
+        # Format: "1.Siedziba 1-kraj POLSKA..."
+        # Szuka linii zawierających "Siedziba" lub "Adres"
+        lines = section.split('\n')
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
             
-            # Szuka wszystkich wpisów z numerami wpisów
-            entries = re.finditer(r'(\d+)\s*-([^-\n]*?)(?=\n(?:\d+)\s*-|Rubryka|\Z)', section, re.DOTALL)
-            
-            for entry in entries:
-                nr_wpisu = entry.group(1).strip()
-                content = entry.group(2).strip()
-                
-                # Parsuje zawartość adresu
-                if 'Siedziba' in content or 'Adres' in content:
-                    adresy.append({
-                        'typ': 'Siedziba' if 'Siedziba' in content else 'Adres',
-                        'nr_wpisu': nr_wpisu,
-                        'content': content
-                    })
+            # Szuka linii "1.Siedziba" lub "2.Adres"
+            if ('Siedziba' in line or 'Adres' in line) and '-' in line:
+                # Wydobywa nr wpisu
+                nr_wpisu_match = re.search(r'(\d+)-', line)
+                if nr_wpisu_match:
+                    nr_wpisu = nr_wpisu_match.group(1)
+                    
+                    # Wydobywa zawartość (może być wielolinijkowa)
+                    content = re.sub(r'^\d+\.\s*\w+\s+\d+-', '', line).strip()
+                    
+                    # Jeśli jest więcej zawartości poniżej
+                    i += 1
+                    while i < len(lines) and lines[i].strip() and not re.match(r'^\d+\.', lines[i]):
+                        content += " " + lines[i].strip()
+                        i += 1
+                    
+                    if content:
+                        adresy.append({
+                            'typ': 'Siedziba' if 'Siedziba' in line else 'Adres',
+                            'nr_wpisu': nr_wpisu,
+                            'content': content
+                        })
+                    continue
+            i += 1
         
         return adresy
     
     def extract_wspolnicy_akcjonariusze(self, text: str) -> List[Dict]:
-        """Wyciąga wspólników i akcjonariuszy"""
+        """Wyciąga wspólników i akcjonariuszy z Rubryki 7"""
         wspolnicy = []
         
-        # Szuka sekcji Dane wspólników
-        pattern = r'Rubryka 7\s+Dane wspólników(.*?)(?=Rubryka 8|Dział 2|\Z)'
+        # Szuka sekcji Rubryka 7
+        pattern = r'Rubryka 7\s+Dane wspólników(.*?)(?=Rubryka 8|Kapitał spółki|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
-            
-            # Szuka bloków wspólników (L.p. = lp liczba porządkowa)
-            lp_pattern = r'(\d+)\s+1\.Nazwisko / Nazwa lub firma\s+(\d+)-(.*?)(?=(?:\d+)\s+1\.Nazwisko|\Z)'
-            
-            for lp_match in re.finditer(lp_pattern, section, re.DOTALL):
-                lp = lp_match.group(1)
-                nr_wpisu = lp_match.group(2)
-                content = lp_match.group(3)
-                
-                # Ekstrahuje dane wspólnika
-                wspolnik = self._parse_wspolnik(content, nr_wpisu)
-                if wspolnik:
-                    wspolnicy.append(wspolnik)
+        if not match:
+            return wspolnicy
+        
+        section = match.group(1)
+        
+        # Szuka bloków wspólników - każdy zaczyna się od "L.p." lub bezpośrednio od numeru
+        # Format: "1 1.Nazwisko / Nazwa lub firma 1-JANOSKA"
+        
+        # Szuka wszystkich wspólników (L.p. = liczba porządkowa)
+        wspolnik_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=\n\d+\s+1\.Nazwisko|Rubryka 8|Kapitał|\Z)'
+        
+        for wspolnik_match in re.finditer(wspolnik_pattern, section, re.DOTALL):
+            wspolnik_block = wspolnik_match.group(0)
+            wspolnik = self._parse_wspolnik(wspolnik_block)
+            if wspolnik:
+                wspolnicy.append(wspolnik)
         
         return wspolnicy
     
-    def _parse_wspolnik(self, content: str, nr_wpisu: str) -> Optional[Dict]:
-        """Parsuje dane wspólnika"""
+    def _parse_wspolnik(self, content: str) -> Optional[Dict]:
+        """Parsuje dane wspólnika z bloku tekstu"""
         wspolnik = {
-            'nr_wpisu': nr_wpisu,
+            'lp': '',
+            'nr_wpisu': '',
             'nazwisko': '',
             'imiona': '',
             'pesel_regon': '',
@@ -155,109 +185,151 @@ class KRSPDFExtractor:
             'procent': '0'
         }
         
-        # Nazwisko
-        match = re.search(r'1\.Nazwisko.*?(\d+)-(.*?)(?=\n2\.)', content, re.DOTALL)
+        # Liczba porządkowa
+        match = re.search(r'^(\d+)\s+1\.', content)
         if match:
-            wspolnik['nazwisko'] = match.group(2).strip()
+            wspolnik['lp'] = match.group(1)
+        
+        # Nazwisko
+        match = re.search(r'1\.Nazwisko.*?\d+-(.+?)(?=\n2\.)', content, re.DOTALL)
+        if match:
+            wspolnik['nazwisko'] = match.group(1).strip()
         
         # Imiona
-        match = re.search(r'2\.Imiona\s+(\d+)-(.*?)(?=\n3\.)', content, re.DOTALL)
+        match = re.search(r'2\.Imiona\s+\d+-(.+?)(?=\n3\.)', content, re.DOTALL)
         if match:
-            wspolnik['imiona'] = match.group(2).strip()
+            wspolnik['imiona'] = match.group(1).strip()
         
         # PESEL/REGON
-        match = re.search(r'3\.Numer PESEL.*?(\d+)-(.*?)(?=\n4\.)', content, re.DOTALL)
+        match = re.search(r'3\.Numer PESEL.*?\d+-(.+?)(?=\n4\.)', content, re.DOTALL)
         if match:
-            wspolnik['pesel_regon'] = match.group(2).strip()
+            pesel_text = match.group(1).strip()
+            # Wyciąga tylko liczbę PESEL/REGON (pierwszą cyfrową grupę)
+            pesel_match = re.search(r'(\d+)', pesel_text)
+            if pesel_match:
+                wspolnik['pesel_regon'] = pesel_match.group(1)
         
-        # Udziały
-        match = re.search(r'5\.Posiadane przez wspólnika udziały\s+(\d+)-(.*?)(?=\n6\.|\Z)', content, re.DOTALL)
+        # Udziały (pola 5)
+        match = re.search(r'5\.Posiadane przez wspólnika udziały\s+\d+-(.+?)(?=\n6\.)', content, re.DOTALL)
         if match:
-            udzialy_text = match.group(2).strip()
+            udzialy_text = match.group(1).strip()
             wspolnik['udzialy'] = udzialy_text
             
-            # Ekstrahuje procent
+            # Wyciąga procent jeśli jest
             procent_match = re.search(r'(\d+(?:[.,]\d+)?)\s*%', udzialy_text)
             if procent_match:
                 wspolnik['procent'] = procent_match.group(1)
+            
+            # Wyciąga nr wpisu z tego pola
+            nr_wpisu_match = re.search(r'^(\d+)-', match.group(1))
+            if nr_wpisu_match:
+                wspolnik['nr_wpisu'] = nr_wpisu_match.group(1)
         
         return wspolnik if wspolnik['nazwisko'] else None
     
     def extract_organy_reprezentacji(self, text: str) -> List[Dict]:
-        """Wyciąga organy uprawnione do reprezentacji"""
+        """Wyciąga organy uprawnione do reprezentacji (Zarząd)"""
         organy = []
         
-        pattern = r'Rubryka 1\s+Organ uprawniony do reprezentacji podmiotu(.*?)(?=Rubryka 2|Dział 3|\Z)'
+        # Szuka Rubryka 1 w Dziale 2
+        pattern = r'Dział 2.*?Rubryka 1\s+Organ uprawniony do reprezentacji podmiotu(.*?)(?=Rubryka 2|Organ nadzoru|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
-            
-            # Szuka danych osób w organie
-            osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
-            
-            for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
-                osoba = self._parse_osoba_organu(osoba_match.group(0))
-                if osoba:
-                    organy.append(osoba)
+        if not match:
+            return organy
+        
+        section = match.group(1)
+        
+        # Szuka "Dane osób wchodzących w skład organu"
+        osoby_pattern = r'Dane osób wchodzących w skład organu(.*?)(?=Rubryka 2|Organ nadzoru|\Z)'
+        osoby_match = re.search(osoby_pattern, section, re.DOTALL)
+        
+        if not osoby_match:
+            return organy
+        
+        osoby_section = osoby_match.group(1)
+        
+        # Szuka bloków osób - każdy zaczyna się od "L.p."
+        osoba_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=\n\d+\s+1\.Nazwisko|\nRubryka|\Z)'
+        
+        for osoba_match in re.finditer(osoba_pattern, osoby_section, re.DOTALL):
+            osoba_block = osoba_match.group(0)
+            osoba = self._parse_osoba_organu(osoba_block)
+            if osoba:
+                organy.append(osoba)
         
         return organy
     
     def _parse_osoba_organu(self, content: str) -> Optional[Dict]:
         """Parsuje osobę w organie"""
         osoba = {
+            'lp': '',
+            'nr_wpisu': '',
             'nazwisko': '',
             'imiona': '',
             'pesel_regon': '',
-            'funkcja': '',
-            'nr_wpisu': ''
+            'funkcja': ''
         }
         
-        # Nr wpisu
+        # Liczba porządkowa
         match = re.search(r'^(\d+)\s+1\.', content)
+        if match:
+            osoba['lp'] = match.group(1)
+        
+        # Nazwisko
+        match = re.search(r'1\.Nazwisko.*?\d+-(.+?)(?=\n2\.)', content, re.DOTALL)
+        if match:
+            osoba['nazwisko'] = match.group(1).strip()
+        
+        # Imiona
+        match = re.search(r'2\.Imiona\s+\d+-(.+?)(?=\n3\.)', content, re.DOTALL)
+        if match:
+            osoba['imiona'] = match.group(1).strip()
+        
+        # PESEL/REGON
+        match = re.search(r'3\.Numer PESEL.*?\d+-(.+?)(?=\n4\.)', content, re.DOTALL)
+        if match:
+            pesel_text = match.group(1).strip()
+            pesel_match = re.search(r'(\d+)', pesel_text)
+            if pesel_match:
+                osoba['pesel_regon'] = pesel_match.group(1)
+        
+        # Nr wpisu z pola 1 (Nazwisko)
+        match = re.search(r'1\.Nazwisko.*?(\d+)-', content)
         if match:
             osoba['nr_wpisu'] = match.group(1)
         
-        # Nazwisko
-        match = re.search(r'1\.Nazwisko.*?(\d+)-(.*?)(?=\n2\.)', content, re.DOTALL)
+        # Funkcja (pole 5)
+        match = re.search(r'5\.Funkcja w organie\s+\d+-(.+?)(?=\n6\.|\Z)', content, re.DOTALL)
         if match:
-            osoba['nazwisko'] = match.group(2).strip()
-        
-        # Imiona
-        match = re.search(r'2\.Imiona\s+(\d+)-(.*?)(?=\n3\.)', content, re.DOTALL)
-        if match:
-            osoba['imiona'] = match.group(2).strip()
-        
-        # PESEL/REGON
-        match = re.search(r'3\.Numer PESEL.*?(\d+)-(.*?)(?=\n4\.)', content, re.DOTALL)
-        if match:
-            osoba['pesel_regon'] = match.group(2).strip()
-        
-        # Funkcja
-        match = re.search(r'5\.Funkcja.*?(\d+)-(.*?)(?=\n6\.|\Z)', content, re.DOTALL)
-        if match:
-            osoba['funkcja'] = match.group(2).strip()
+            osoba['funkcja'] = match.group(1).strip()
         
         return osoba if osoba['nazwisko'] else None
     
     def extract_organy_nadzoru(self, text: str) -> List[Dict]:
-        """Wyciąga organy nadzoru"""
+        """Wyciąga organy nadzoru (Rada Nadzorcza)"""
         nadzoru = []
         
-        pattern = r'Rubryka 2\s+Organ nadzoru(.*?)(?=Rubryka 3|Dział 3|\Z)'
+        # Szuka Rubryka 2 w Dziale 2
+        pattern = r'Rubryka 2\s+Organ nadzoru(.*?)(?=Rubryka 3|Prokurenci|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
-            
-            if 'Brak wpisów' not in section:
-                # Szuka danych osób nadzoru
-                osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
-                
-                for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
-                    osoba = self._parse_osoba_organu(osoba_match.group(0))
-                    if osoba:
-                        nadzoru.append(osoba)
+        if not match:
+            return nadzoru
+        
+        section = match.group(1)
+        
+        if 'Brak wpisów' in section:
+            return nadzoru
+        
+        # Szuka bloków osób nadzoru
+        osoba_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=\n\d+\s+1\.Nazwisko|\nRubryka|\Z)'
+        
+        for osoba_match in re.finditer(osoba_pattern, section, re.DOTALL):
+            osoba_block = osoba_match.group(0)
+            osoba = self._parse_osoba_organu(osoba_block)
+            if osoba:
+                nadzoru.append(osoba)
         
         return nadzoru
     
@@ -265,79 +337,114 @@ class KRSPDFExtractor:
         """Wyciąga prokurów"""
         prokurenci = []
         
+        # Szuka Rubryka 3 w Dziale 2
         pattern = r'Rubryka 3\s+Prokurenci(.*?)(?=Dział 3|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
-            
-            if 'Brak wpisów' not in section:
-                osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
-                
-                for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
-                    osoba = self._parse_osoba_organu(osoba_match.group(0))
-                    if osoba:
-                        prokurenci.append(osoba)
+        if not match:
+            return prokurenci
+        
+        section = match.group(1)
+        
+        if 'Brak wpisów' in section:
+            return prokurenci
+        
+        # Szuka bloków osób prokurów
+        osoba_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=\n\d+\s+1\.Nazwisko|\nRubryka|\Z)'
+        
+        for osoba_match in re.finditer(osoba_pattern, section, re.DOTALL):
+            osoba_block = osoba_match.group(0)
+            osoba = self._parse_osoba_organu(osoba_block)
+            if osoba:
+                prokurenci.append(osoba)
         
         return prokurenci
     
     def extract_przedmiot_dzialalnosci(self, text: str) -> List[Dict]:
-        """Wyciąga przedmiot działalności (PKD)"""
+        """Wyciąga przedmiot działalności (PKD) z Dział 3, Rubryka 1"""
         dzialalnosc = []
         
-        pattern = r'Rubryka 1\s+Przedmiot działalności(.*?)(?=Rubryka 2|Dział 4|\Z)'
+        # Szuka Dział 3 -> Rubryka 1 Przedmiot działalności
+        pattern = r'Dział 3.*?Rubryka 1\s+Przedmiot działalności(.*?)(?=Rubryka 2|\Z)'
         match = re.search(pattern, text, re.DOTALL)
         
-        if match:
-            section = match.group(1)
+        if not match:
+            return dzialalnosc
+        
+        section = match.group(1)
+        
+        # Szuka "1.Przedmiot przeważającej działalności"
+        przewazajaca_match = re.search(r'1\.Przedmiot przeważającej działalności(.*?)(?=2\.Przedmiot pozostałej|\Z)', section, re.DOTALL)
+        
+        if przewazajaca_match:
+            przewazajaca_section = przewazajaca_match.group(1)
+            # Szuka numerów wpisów z zawartością
+            wpisy_pattern = r'(\d+)\s+(\d+)-(.+?)(?=\n\d+\s+\d+-|$)'
             
-            # Szuka przedmiotów działalności
-            podmioty_pattern = r'(\d+)\s+(\d+)-(.*?)(?=\n(?:\d+)\s+\d+|Rubryka|\Z)'
+            for wpis_match in re.finditer(wpisy_pattern, przewazajaca_section, re.DOTALL):
+                lp = wpis_match.group(1)
+                nr_wpisu = wpis_match.group(2)
+                content = wpis_match.group(3).strip()
+                
+                if content:
+                    dzialalnosc.append({
+                        'typ': 'Przeważająca',
+                        'nr_wpisu': nr_wpisu,
+                        'lp': lp,
+                        'content': content
+                    })
+        
+        # Szuka "2.Przedmiot pozostałej działalności"
+        pozostala_match = re.search(r'2\.Przedmiot pozostałej działalności(.*?)(?=Rubryka 2|\Z)', section, re.DOTALL)
+        
+        if pozostala_match:
+            pozostala_section = pozostala_match.group(1)
+            wpisy_pattern = r'(\d+)\s+(\d+)-(.+?)(?=\n\d+\s+\d+-|$)'
             
-            for pod_match in re.finditer(podmioty_pattern, section, re.DOTALL):
-                lp = pod_match.group(1)
-                nr_wpisu = pod_match.group(2)
-                content = pod_match.group(3).strip()
+            for wpis_match in re.finditer(wpisy_pattern, pozostala_section, re.DOTALL):
+                lp = wpis_match.group(1)
+                nr_wpisu = wpis_match.group(2)
+                content = wpis_match.group(3).strip()
                 
-                # Określa typ (przeważająca czy pozostała)
-                typ = "Przeważająca" if "przeważającej" in section[:section.find(content)] else "Pozostała"
-                
-                dzialalnosc.append({
-                    'lp': lp,
-                    'nr_wpisu': nr_wpisu,
-                    'typ': typ,
-                    'content': content
-                })
+                if content:
+                    dzialalnosc.append({
+                        'typ': 'Pozostała',
+                        'nr_wpisu': nr_wpisu,
+                        'lp': lp,
+                        'content': content
+                    })
         
         return dzialalnosc
     
     def extract_zestawienie_zmian(self, text: str) -> List[Dict]:
-        """Wyciąga zestawienie zmian (Nr wpisu + Data + Opis)"""
+        """Wyciąga zestawienie zmian z początku dokumentu"""
         zmiany = []
         
-        # Szuka danych z początku dokumentu (Nr wpisu X Data...)
-        pattern = r'Nr wpisu\s+(\d+)\s+Data dokonania wpisu\s+([\d.]+)\s+Opis\s+(.*?)(?=Nr wpisu|\Z)'
+        # Szuka sekcji z "Nr wpisu X Data dokonania wpisu"
+        pattern = r'Nr wpisu\s+(\d+)\s+Data dokonania wpisu\s+([\d.]+)\s+Opis\s+(.*?)(?=Nr wpisu\s+\d+\s+Data|Stan na dzień|\Z)'
         
         for match in re.finditer(pattern, text, re.DOTALL):
             nr_wpisu = match.group(1)
             data = match.group(2)
-            opis = match.group(3).strip()
+            opis_raw = match.group(3).strip()
             
-            # Wydobywa sygnaturę i sąd
-            sygnatura_match = re.search(r'Sygnatura akt\s+(.*?)(?=\n|Oznaczenie)', opis)
+            # Wyciąga sygnaturę akt
+            sygnatura_match = re.search(r'Sygnatura akt\s+([^\n]+)', opis_raw)
             sygnatura = sygnatura_match.group(1).strip() if sygnatura_match else ""
             
-            sad_match = re.search(r'Oznaczenie sądu\s+(.*?)(?=\nNr wpisu|$)', opis, re.DOTALL)
+            # Wyciąga sąd
+            sad_match = re.search(r'Oznaczenie sądu\s+([^\n]+?)(?=Nr wpisu|$)', opis_raw, re.DOTALL)
             sad = sad_match.group(1).strip() if sad_match else ""
             
-            # Oczyszcza opis
-            opis_clean = re.sub(r'Sygnatura akt.*?(?=\n|$)', '', opis, flags=re.DOTALL).strip()
-            opis_clean = re.sub(r'Oznaczenie sądu.*?(?=\n|$)', '', opis_clean, flags=re.DOTALL).strip()
+            # Wyciąga opis (bez sygnatur i sądów)
+            opis = re.sub(r'Sygnatura akt.*', '', opis_raw).strip()
+            opis = re.sub(r'Oznaczenie sądu.*', '', opis).strip()
+            opis = opis.split('\n')[0].strip()
             
             zmiany.append({
                 'nr_wpisu': nr_wpisu,
                 'data': data,
-                'opis': opis_clean,
+                'opis': opis,
                 'sygnatura': sygnatura,
                 'sad': sad
             })
@@ -372,7 +479,7 @@ class KRSConverterGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("KRS PDF to CSV Converter v3.0")
+        self.root.title("KRS PDF to CSV Converter v3.1")
         self.root.geometry("750x650")
         self.root.resizable(True, True)
         
@@ -399,7 +506,7 @@ class KRSConverterGUI:
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Tytuł
-        title_label = ttk.Label(main_frame, text="KRS PDF to CSV Converter v3.0", font=("Arial", 16, "bold"))
+        title_label = ttk.Label(main_frame, text="KRS PDF to CSV Converter v3.1", font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=2, pady=10)
         
         # Separator
@@ -525,13 +632,14 @@ class KRSConverterGUI:
                     data = self.extractor.extract_all_data(pdf_path)
                     
                     # 1. Podmioty
-                    all_podmioty.append({
-                        'Numer KRS': data['numer_krs'],
-                        'Nazwa Firmy': data['nazwa_firmy'],
-                        'Forma Prawna': data['forma_prawna'],
-                        'REGON': data['regon'],
-                        'NIP': data['nip']
-                    })
+                    if data['numer_krs']:
+                        all_podmioty.append({
+                            'Numer KRS': data['numer_krs'],
+                            'Nazwa Firmy': data['nazwa_firmy'],
+                            'Forma Prawna': data['forma_prawna'],
+                            'REGON': data['regon'],
+                            'NIP': data['nip']
+                        })
                     
                     # 2. Adresy
                     for addr in data['siedziby_adresy']:
@@ -548,6 +656,7 @@ class KRSConverterGUI:
                         all_wspolnicy.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
+                            'L.p.': wspolnik.get('lp', ''),
                             'Imiona': wspolnik.get('imiona', ''),
                             'Nazwisko': wspolnik.get('nazwisko', ''),
                             'PESEL/REGON': wspolnik.get('pesel_regon', ''),
@@ -561,6 +670,7 @@ class KRSConverterGUI:
                         all_organy_repr.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
+                            'L.p.': organ.get('lp', ''),
                             'Imiona': organ.get('imiona', ''),
                             'Nazwisko': organ.get('nazwisko', ''),
                             'PESEL/REGON': organ.get('pesel_regon', ''),
@@ -573,6 +683,7 @@ class KRSConverterGUI:
                         all_organy_nadzoru.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
+                            'L.p.': nadzor.get('lp', ''),
                             'Imiona': nadzor.get('imiona', ''),
                             'Nazwisko': nadzor.get('nazwisko', ''),
                             'PESEL/REGON': nadzor.get('pesel_regon', ''),
@@ -585,6 +696,7 @@ class KRSConverterGUI:
                         all_prokurenci.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
+                            'L.p.': prokurent.get('lp', ''),
                             'Imiona': prokurent.get('imiona', ''),
                             'Nazwisko': prokurent.get('nazwisko', ''),
                             'PESEL/REGON': prokurent.get('pesel_regon', ''),
@@ -596,6 +708,7 @@ class KRSConverterGUI:
                         all_dzialalnosc.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
+                            'L.p.': dzialalnosc.get('lp', ''),
                             'Typ': dzialalnosc.get('typ', ''),
                             'Zawartość': dzialalnosc.get('content', ''),
                             'Nr Wpisu': dzialalnosc.get('nr_wpisu', '')
