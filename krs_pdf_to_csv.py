@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KRS PDF to CSV Converter - GUI Version
+KRS PDF to CSV Converter - v3.0 (Kompletna Wersja)
 Aplikacja do konwersji plików PDF z KRS na ustrukturyzowane pliki CSV
-Wymaga: pip install PyPDF2 pdfplumber pandas tkinter-filedialog
+Ekstrahuje wszystkie kategorie danych: wspólnicy, kierownictwo, adresy, prokurenci, etc.
 """
 
 import os
@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import pdfplumber
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple, Optional
 
 
 class KRSPDFExtractor:
@@ -29,14 +29,19 @@ class KRSPDFExtractor:
     def reset_data(self):
         """Resetuje dane"""
         self.data = {
-            'nazwa_firmy': '',
             'numer_krs': '',
-            'adres': '',
-            'pracownicy': [],
-            'kierownictwo': [],
+            'nazwa_firmy': '',
+            'forma_prawna': '',
+            'regon': '',
+            'nip': '',
+            'siedziby_adresy': [],
+            'wspolnicy_akcjonariusze': [],
+            'organy_reprezentacji': [],
+            'organy_nadzoru': [],
             'prokurenci': [],
-            'daty_zmian': [],
-            'zakres_działalności': ''
+            'przedmiot_dzialalnosci': [],
+            'zestawienie_zmian': [],
+            'zestawienie_dokumentow': []
         }
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
@@ -48,84 +53,296 @@ class KRSPDFExtractor:
                     text += page.extract_text() or ""
             return text
         except Exception as e:
-            print(f"❌ Błąd podczas czytania PDF: {e}")
+            print(f"Błąd podczas czytania PDF: {e}")
             return ""
     
     def extract_krs_number(self, text: str) -> str:
-        """Wyciąga numer KRS z tekstu"""
-        patterns = [
-            r'KRS\s*[:\-]?\s*(\d{10})',
-            r'Numer\s+KRS\s*[:\-]?\s*(\d{10})',
-            r'(\d{10})(?=\s*KRS)'
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                return match.group(1)
+        """Wyciąga numer KRS"""
+        match = re.search(r'Numer KRS:\s*(\d{10})', text)
+        if match:
+            return match.group(1)
         return ""
     
     def extract_company_name(self, text: str) -> str:
-        """Wyciąga nazwę firmy"""
-        lines = text.split('\n')
-        for i, line in enumerate(lines[:30]):
-            line = line.strip()
-            if len(line) > 5 and not any(skip in line.upper() for skip in ['KRS', 'NUMER', 'TELEFON', 'EMAIL', 'INFORMACJA']):
-                if line and line[0].isupper() and not line.startswith('Odpis'):
-                    return line
+        """Wyciąga nazwę firmy (Firma, pod którą spółka działa)"""
+        match = re.search(r'3\.Firma, pod którą spółka działa\s+(\d+)-(.*?)(?=\n[0-9]\.|\Z)', text, re.DOTALL)
+        if match:
+            return match.group(2).strip()
         return ""
     
-    def extract_address(self, text: str) -> str:
-        """Wyciąga adres siedziby firmy"""
-        patterns = [
-            r'[Ss]iedziba\s*[:\-]?\s*(.+?)(?=\n|$)',
-            r'[Aa]dres\s*[:\-]?\s*(.+?)(?=\n|$)',
-            r'ul\.\s+([^\n]+)',
-            r'al\.\s+([^\n]+)'
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1).strip()
+    def extract_legal_form(self, text: str) -> str:
+        """Wyciąga formę prawną"""
+        match = re.search(r'1\.Oznaczenie formy prawnej\s+(\d+)-(.*?)(?=\n[0-9]\.|\Z)', text, re.DOTALL)
+        if match:
+            return match.group(2).strip()
         return ""
     
-    def extract_people_section(self, text: str, section_name: str) -> List[str]:
-        """Wyciąga listę osób z danej sekcji"""
-        people = []
+    def extract_regon_nip(self, text: str) -> Tuple[str, str]:
+        """Wyciąga REGON i NIP"""
+        regon = ""
+        nip = ""
         
-        pattern = rf'{section_name.upper()}.*?(?=\n\n|\n[A-Z]{{2,}}|Zmiana|Skreślenie|$)'
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        match = re.search(r'2\.Numer REGON/NIP.*?REGON:\s*([\d-]+).*?NIP:\s*([\d]+)', text, re.DOTALL)
+        if match:
+            regon = match.group(1).strip()
+            nip = match.group(2).strip()
+        
+        return regon, nip
+    
+    def extract_siedziby_adresy(self, text: str) -> List[Dict]:
+        """Wyciąga siedziby i adresy"""
+        adresy = []
+        
+        # Szuka sekcji Siedziba i adres
+        pattern = r'Rubryka 2\s+Siedziba i adres podmiotu(.*?)(?=Rubryka 3|Dział 2|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
         
         if match:
-            section_text = match.group(0)
-            lines = section_text.split('\n')
-            for line in lines:
-                line = line.strip()
-                # Szuka linii zawierających imiona i nazwiska
-                if line and len(line) > 3 and not any(skip in line for skip in [':', '---', '###', section_name.upper()]):
-                    if re.search(r'^[A-Z][a-ząćęłńóśźż]+(\s+[A-Z][a-ząćęłńóśźż]+)+', line):
-                        people.append(line)
+            section = match.group(1)
+            
+            # Szuka wszystkich wpisów z numerami wpisów
+            entries = re.finditer(r'(\d+)\s*-([^-\n]*?)(?=\n(?:\d+)\s*-|Rubryka|\Z)', section, re.DOTALL)
+            
+            for entry in entries:
+                nr_wpisu = entry.group(1).strip()
+                content = entry.group(2).strip()
+                
+                # Parsuje zawartość adresu
+                if 'Siedziba' in content or 'Adres' in content:
+                    adresy.append({
+                        'typ': 'Siedziba' if 'Siedziba' in content else 'Adres',
+                        'nr_wpisu': nr_wpisu,
+                        'content': content
+                    })
         
-        return people
+        return adresy
     
-    def extract_activity_scope(self, text: str) -> str:
-        """Wyciąga zakres działalności (sekcja PKD)"""
-        patterns = [
-            r'[Pp]rzedmiot\s+[Dd]ziałalności.*?(?=\n\n|\n[A-Z]{2})',
-            r'PKD.*?(?=\n\n|\n[A-Z]{2})',
-            r'[Dd]ziałalność.*?(?=\n\n|\n[A-Z]{2})'
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                return match.group(0).strip()
-        return ""
+    def extract_wspolnicy_akcjonariusze(self, text: str) -> List[Dict]:
+        """Wyciąga wspólników i akcjonariuszy"""
+        wspolnicy = []
+        
+        # Szuka sekcji Dane wspólników
+        pattern = r'Rubryka 7\s+Dane wspólników(.*?)(?=Rubryka 8|Dział 2|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            section = match.group(1)
+            
+            # Szuka bloków wspólników (L.p. = lp liczba porządkowa)
+            lp_pattern = r'(\d+)\s+1\.Nazwisko / Nazwa lub firma\s+(\d+)-(.*?)(?=(?:\d+)\s+1\.Nazwisko|\Z)'
+            
+            for lp_match in re.finditer(lp_pattern, section, re.DOTALL):
+                lp = lp_match.group(1)
+                nr_wpisu = lp_match.group(2)
+                content = lp_match.group(3)
+                
+                # Ekstrahuje dane wspólnika
+                wspolnik = self._parse_wspolnik(content, nr_wpisu)
+                if wspolnik:
+                    wspolnicy.append(wspolnik)
+        
+        return wspolnicy
     
-    def extract_change_dates(self, text: str) -> List[str]:
-        """Wyciąga daty zmian wpisów"""
-        date_pattern = r'\d{1,2}[-./]\d{1,2}[-./]\d{4}'
-        matches = re.findall(date_pattern, text)
-        dates = sorted(set(matches), reverse=True)
-        return dates
+    def _parse_wspolnik(self, content: str, nr_wpisu: str) -> Optional[Dict]:
+        """Parsuje dane wspólnika"""
+        wspolnik = {
+            'nr_wpisu': nr_wpisu,
+            'nazwisko': '',
+            'imiona': '',
+            'pesel_regon': '',
+            'udzialy': '',
+            'wartosc': '',
+            'procent': '0'
+        }
+        
+        # Nazwisko
+        match = re.search(r'1\.Nazwisko.*?(\d+)-(.*?)(?=\n2\.)', content, re.DOTALL)
+        if match:
+            wspolnik['nazwisko'] = match.group(2).strip()
+        
+        # Imiona
+        match = re.search(r'2\.Imiona\s+(\d+)-(.*?)(?=\n3\.)', content, re.DOTALL)
+        if match:
+            wspolnik['imiona'] = match.group(2).strip()
+        
+        # PESEL/REGON
+        match = re.search(r'3\.Numer PESEL.*?(\d+)-(.*?)(?=\n4\.)', content, re.DOTALL)
+        if match:
+            wspolnik['pesel_regon'] = match.group(2).strip()
+        
+        # Udziały
+        match = re.search(r'5\.Posiadane przez wspólnika udziały\s+(\d+)-(.*?)(?=\n6\.|\Z)', content, re.DOTALL)
+        if match:
+            udzialy_text = match.group(2).strip()
+            wspolnik['udzialy'] = udzialy_text
+            
+            # Ekstrahuje procent
+            procent_match = re.search(r'(\d+(?:[.,]\d+)?)\s*%', udzialy_text)
+            if procent_match:
+                wspolnik['procent'] = procent_match.group(1)
+        
+        return wspolnik if wspolnik['nazwisko'] else None
+    
+    def extract_organy_reprezentacji(self, text: str) -> List[Dict]:
+        """Wyciąga organy uprawnione do reprezentacji"""
+        organy = []
+        
+        pattern = r'Rubryka 1\s+Organ uprawniony do reprezentacji podmiotu(.*?)(?=Rubryka 2|Dział 3|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            section = match.group(1)
+            
+            # Szuka danych osób w organie
+            osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
+            
+            for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
+                osoba = self._parse_osoba_organu(osoba_match.group(0))
+                if osoba:
+                    organy.append(osoba)
+        
+        return organy
+    
+    def _parse_osoba_organu(self, content: str) -> Optional[Dict]:
+        """Parsuje osobę w organie"""
+        osoba = {
+            'nazwisko': '',
+            'imiona': '',
+            'pesel_regon': '',
+            'funkcja': '',
+            'nr_wpisu': ''
+        }
+        
+        # Nr wpisu
+        match = re.search(r'^(\d+)\s+1\.', content)
+        if match:
+            osoba['nr_wpisu'] = match.group(1)
+        
+        # Nazwisko
+        match = re.search(r'1\.Nazwisko.*?(\d+)-(.*?)(?=\n2\.)', content, re.DOTALL)
+        if match:
+            osoba['nazwisko'] = match.group(2).strip()
+        
+        # Imiona
+        match = re.search(r'2\.Imiona\s+(\d+)-(.*?)(?=\n3\.)', content, re.DOTALL)
+        if match:
+            osoba['imiona'] = match.group(2).strip()
+        
+        # PESEL/REGON
+        match = re.search(r'3\.Numer PESEL.*?(\d+)-(.*?)(?=\n4\.)', content, re.DOTALL)
+        if match:
+            osoba['pesel_regon'] = match.group(2).strip()
+        
+        # Funkcja
+        match = re.search(r'5\.Funkcja.*?(\d+)-(.*?)(?=\n6\.|\Z)', content, re.DOTALL)
+        if match:
+            osoba['funkcja'] = match.group(2).strip()
+        
+        return osoba if osoba['nazwisko'] else None
+    
+    def extract_organy_nadzoru(self, text: str) -> List[Dict]:
+        """Wyciąga organy nadzoru"""
+        nadzoru = []
+        
+        pattern = r'Rubryka 2\s+Organ nadzoru(.*?)(?=Rubryka 3|Dział 3|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            section = match.group(1)
+            
+            if 'Brak wpisów' not in section:
+                # Szuka danych osób nadzoru
+                osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
+                
+                for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
+                    osoba = self._parse_osoba_organu(osoba_match.group(0))
+                    if osoba:
+                        nadzoru.append(osoba)
+        
+        return nadzoru
+    
+    def extract_prokurenci(self, text: str) -> List[Dict]:
+        """Wyciąga prokurów"""
+        prokurenci = []
+        
+        pattern = r'Rubryka 3\s+Prokurenci(.*?)(?=Dział 3|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            section = match.group(1)
+            
+            if 'Brak wpisów' not in section:
+                osoby_pattern = r'(\d+)\s+1\.Nazwisko.*?(?=(?:\d+)\s+1\.Nazwisko|\Z)'
+                
+                for osoba_match in re.finditer(osoby_pattern, section, re.DOTALL):
+                    osoba = self._parse_osoba_organu(osoba_match.group(0))
+                    if osoba:
+                        prokurenci.append(osoba)
+        
+        return prokurenci
+    
+    def extract_przedmiot_dzialalnosci(self, text: str) -> List[Dict]:
+        """Wyciąga przedmiot działalności (PKD)"""
+        dzialalnosc = []
+        
+        pattern = r'Rubryka 1\s+Przedmiot działalności(.*?)(?=Rubryka 2|Dział 4|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            section = match.group(1)
+            
+            # Szuka przedmiotów działalności
+            podmioty_pattern = r'(\d+)\s+(\d+)-(.*?)(?=\n(?:\d+)\s+\d+|Rubryka|\Z)'
+            
+            for pod_match in re.finditer(podmioty_pattern, section, re.DOTALL):
+                lp = pod_match.group(1)
+                nr_wpisu = pod_match.group(2)
+                content = pod_match.group(3).strip()
+                
+                # Określa typ (przeważająca czy pozostała)
+                typ = "Przeważająca" if "przeważającej" in section[:section.find(content)] else "Pozostała"
+                
+                dzialalnosc.append({
+                    'lp': lp,
+                    'nr_wpisu': nr_wpisu,
+                    'typ': typ,
+                    'content': content
+                })
+        
+        return dzialalnosc
+    
+    def extract_zestawienie_zmian(self, text: str) -> List[Dict]:
+        """Wyciąga zestawienie zmian (Nr wpisu + Data + Opis)"""
+        zmiany = []
+        
+        # Szuka danych z początku dokumentu (Nr wpisu X Data...)
+        pattern = r'Nr wpisu\s+(\d+)\s+Data dokonania wpisu\s+([\d.]+)\s+Opis\s+(.*?)(?=Nr wpisu|\Z)'
+        
+        for match in re.finditer(pattern, text, re.DOTALL):
+            nr_wpisu = match.group(1)
+            data = match.group(2)
+            opis = match.group(3).strip()
+            
+            # Wydobywa sygnaturę i sąd
+            sygnatura_match = re.search(r'Sygnatura akt\s+(.*?)(?=\n|Oznaczenie)', opis)
+            sygnatura = sygnatura_match.group(1).strip() if sygnatura_match else ""
+            
+            sad_match = re.search(r'Oznaczenie sądu\s+(.*?)(?=\nNr wpisu|$)', opis, re.DOTALL)
+            sad = sad_match.group(1).strip() if sad_match else ""
+            
+            # Oczyszcza opis
+            opis_clean = re.sub(r'Sygnatura akt.*?(?=\n|$)', '', opis, flags=re.DOTALL).strip()
+            opis_clean = re.sub(r'Oznaczenie sądu.*?(?=\n|$)', '', opis_clean, flags=re.DOTALL).strip()
+            
+            zmiany.append({
+                'nr_wpisu': nr_wpisu,
+                'data': data,
+                'opis': opis_clean,
+                'sygnatura': sygnatura,
+                'sad': sad
+            })
+        
+        return zmiany
     
     def extract_all_data(self, pdf_path: str) -> Dict:
         """Główna metoda ekstrakcji wszystkich danych"""
@@ -137,12 +354,15 @@ class KRSPDFExtractor:
         
         self.data['numer_krs'] = self.extract_krs_number(text)
         self.data['nazwa_firmy'] = self.extract_company_name(text)
-        self.data['adres'] = self.extract_address(text)
-        self.data['pracownicy'] = self.extract_people_section(text, 'pracownik')
-        self.data['kierownictwo'] = self.extract_people_section(text, 'kierownik')
-        self.data['prokurenci'] = self.extract_people_section(text, 'prokurent')
-        self.data['daty_zmian'] = self.extract_change_dates(text)
-        self.data['zakres_działalności'] = self.extract_activity_scope(text)
+        self.data['forma_prawna'] = self.extract_legal_form(text)
+        self.data['regon'], self.data['nip'] = self.extract_regon_nip(text)
+        self.data['siedziby_adresy'] = self.extract_siedziby_adresy(text)
+        self.data['wspolnicy_akcjonariusze'] = self.extract_wspolnicy_akcjonariusze(text)
+        self.data['organy_reprezentacji'] = self.extract_organy_reprezentacji(text)
+        self.data['organy_nadzoru'] = self.extract_organy_nadzoru(text)
+        self.data['prokurenci'] = self.extract_prokurenci(text)
+        self.data['przedmiot_dzialalnosci'] = self.extract_przedmiot_dzialalnosci(text)
+        self.data['zestawienie_zmian'] = self.extract_zestawienie_zmian(text)
         
         return self.data
 
@@ -152,14 +372,13 @@ class KRSConverterGUI:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("KRS PDF to CSV Converter")
-        self.root.geometry("700x600")
+        self.root.title("KRS PDF to CSV Converter v3.0")
+        self.root.geometry("750x650")
         self.root.resizable(True, True)
         
-        # Zmienne
         self.selected_files = []
         self.extractor = KRSPDFExtractor()
-        self.output_dir = None
+        self.output_dir = str(Path.home() / "Desktop")
         self.is_processing = False
         
         self.setup_ui()
@@ -176,117 +395,58 @@ class KRSConverterGUI:
     
     def setup_ui(self):
         """Tworzy interfejs użytkownika"""
-        
-        # Frame główny
         main_frame = ttk.Frame(self.root, padding="20")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Tytuł
-        title_label = ttk.Label(
-            main_frame,
-            text="KRS PDF to CSV Converter",
-            font=("Arial", 16, "bold")
-        )
+        title_label = ttk.Label(main_frame, text="KRS PDF to CSV Converter v3.0", font=("Arial", 16, "bold"))
         title_label.grid(row=0, column=0, columnspan=2, pady=10)
         
         # Separator
-        separator = ttk.Separator(main_frame, orient="horizontal")
-        separator.grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Separator(main_frame, orient="horizontal").grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
         
         # Przycisk wyboru plików
-        select_button = ttk.Button(
-            main_frame,
-            text="📁 Wybierz pliki PDF",
-            command=self.select_files
-        )
-        select_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Button(main_frame, text="📁 Wybierz pliki PDF", command=self.select_files).grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
         
-        # Rama z listą plików
+        # Lista plików
         list_frame = ttk.LabelFrame(main_frame, text="Wybrane pliki PDF", padding="10")
         list_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=10)
         
-        # Scrollbar
         scrollbar = ttk.Scrollbar(list_frame)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Listbox
-        self.file_listbox = tk.Listbox(
-            list_frame,
-            yscrollcommand=scrollbar.set,
-            height=10
-        )
+        self.file_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, height=10)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.file_listbox.yview)
         
-        # Przycisk usuwania pliku
-        remove_button = ttk.Button(
-            main_frame,
-            text="🗑️ Usuń zaznaczony plik",
-            command=self.remove_selected_file
-        )
-        remove_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=5)
+        # Przycisk usuwania
+        ttk.Button(main_frame, text="🗑️ Usuń zaznaczony plik", command=self.remove_selected_file).grid(row=4, column=0, columnspan=2, sticky="ew", pady=5)
         
-        # Separator
-        separator2 = ttk.Separator(main_frame, orient="horizontal")
-        separator2.grid(row=5, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Separator(main_frame, orient="horizontal").grid(row=5, column=0, columnspan=2, sticky="ew", pady=10)
         
-        # Przycisk wyboru folderu wyjścia
-        output_button = ttk.Button(
-            main_frame,
-            text="📂 Wybierz folder do zapisu",
-            command=self.select_output_dir
-        )
-        output_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
+        # Folder wyjścia
+        ttk.Button(main_frame, text="📂 Wybierz folder do zapisu", command=self.select_output_dir).grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
         
-        # Label z folderem wyjścia
-        self.output_label = ttk.Label(
-            main_frame,
-            text="Folder: Pulpit",
-            foreground="blue"
-        )
+        self.output_label = ttk.Label(main_frame, text="Folder: Pulpit", foreground="blue")
         self.output_label.grid(row=7, column=0, columnspan=2, sticky="ew", pady=5)
-        self.output_dir = str(Path.home() / "Desktop")
         
-        # Separator
-        separator3 = ttk.Separator(main_frame, orient="horizontal")
-        separator3.grid(row=8, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Separator(main_frame, orient="horizontal").grid(row=8, column=0, columnspan=2, sticky="ew", pady=10)
         
         # Progress bar
-        self.progress = ttk.Progressbar(
-            main_frame,
-            mode="indeterminate"
-        )
+        self.progress = ttk.Progressbar(main_frame, mode="indeterminate")
         self.progress.grid(row=9, column=0, columnspan=2, sticky="ew", pady=5)
         
-        # Status label
-        self.status_label = ttk.Label(
-            main_frame,
-            text="Gotowy do pracy",
-            foreground="green"
-        )
+        # Status
+        self.status_label = ttk.Label(main_frame, text="Gotowy do pracy", foreground="green")
         self.status_label.grid(row=10, column=0, columnspan=2, sticky="ew", pady=5)
         
-        # Frame na przyciski
+        # Przyciski
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=11, column=0, columnspan=2, sticky="ew", pady=10)
         
-        # Przycisk konwersji
-        convert_button = ttk.Button(
-            button_frame,
-            text="✅ Konwertuj do CSV",
-            command=self.start_conversion
-        )
-        convert_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(button_frame, text="✅ Konwertuj do CSV", command=self.start_conversion).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(button_frame, text="❌ Wyjście", command=self.root.quit).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
         
-        # Przycisk wyjścia
-        exit_button = ttk.Button(
-            button_frame,
-            text="❌ Wyjście",
-            command=self.root.quit
-        )
-        exit_button.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
-        
-        # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
@@ -294,37 +454,31 @@ class KRSConverterGUI:
     
     def select_files(self):
         """Otwiera dialog wyboru plików"""
-        files = filedialog.askopenfilenames(
-            title="Wybierz pliki PDF",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
-        )
-        
+        files = filedialog.askopenfilenames(title="Wybierz pliki PDF", filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
         if files:
             self.selected_files.extend(files)
             self.update_file_list()
             self.update_status(f"Wybrano {len(self.selected_files)} plik(ów)", "blue")
     
     def remove_selected_file(self):
-        """Usuwa zaznaczony plik z listy"""
+        """Usuwa zaznaczony plik"""
         selection = self.file_listbox.curselection()
         if selection:
-            index = selection[0]
-            self.selected_files.pop(index)
+            self.selected_files.pop(selection[0])
             self.update_file_list()
             self.update_status(f"Pozostało {len(self.selected_files)} plik(ów)", "blue")
     
     def update_file_list(self):
-        """Aktualizuje listę wybranych plików"""
+        """Aktualizuje listę"""
         self.file_listbox.delete(0, tk.END)
         for file in self.selected_files:
             self.file_listbox.insert(tk.END, Path(file).name)
     
     def select_output_dir(self):
-        """Otwiera dialog wyboru folderu"""
-        folder = filedialog.askdirectory(title="Wybierz folder do zapisu plików CSV")
+        """Wybiera folder wyjścia"""
+        folder = filedialog.askdirectory(title="Wybierz folder do zapisu")
         if folder:
             self.output_dir = folder
-            # Wyświetla skróconą ścieżkę
             display_path = folder if len(folder) < 40 else "..." + folder[-37:]
             self.output_label.config(text=f"Folder: {display_path}")
     
@@ -334,20 +488,15 @@ class KRSConverterGUI:
         self.root.update()
     
     def start_conversion(self):
-        """Uruchamia konwersję w osobnym wątku"""
+        """Uruchamia konwersję"""
         if not self.selected_files:
             messagebox.showwarning("Błąd", "Nie wybrano żadnych plików!")
-            return
-        
-        if not self.output_dir:
-            messagebox.showwarning("Błąd", "Nie wybrano folderu do zapisu!")
             return
         
         if self.is_processing:
             messagebox.showwarning("Ostrzeżenie", "Konwersja już trwa!")
             return
         
-        # Uruchamia konwersję w osobnym wątku
         thread = threading.Thread(target=self.convert_files)
         thread.start()
     
@@ -358,13 +507,15 @@ class KRSConverterGUI:
         self.update_status("Przetwarzam pliki...", "orange")
         
         try:
-            # Kolekcje danych
-            all_firms = []
-            all_employees = []
-            all_management = []
-            all_attorneys = []
-            all_activities = []
-            all_dates = []
+            # Inicjalizacja kolekcji
+            all_podmioty = []
+            all_adresy = []
+            all_wspolnicy = []
+            all_organy_repr = []
+            all_organy_nadzoru = []
+            all_prokurenci = []
+            all_dzialalnosc = []
+            all_zmiany = []
             
             total_files = len(self.selected_files)
             
@@ -373,53 +524,93 @@ class KRSConverterGUI:
                 try:
                     data = self.extractor.extract_all_data(pdf_path)
                     
-                    # Zbieranie danych do firm
-                    firm_record = {
-                        'Nazwa Firmy': data['nazwa_firmy'],
+                    # 1. Podmioty
+                    all_podmioty.append({
                         'Numer KRS': data['numer_krs'],
-                        'Adres': data['adres'],
-                        'Zakres Działalności': data['zakres_działalności']
-                    }
-                    all_firms.append(firm_record)
+                        'Nazwa Firmy': data['nazwa_firmy'],
+                        'Forma Prawna': data['forma_prawna'],
+                        'REGON': data['regon'],
+                        'NIP': data['nip']
+                    })
                     
-                    # Zbieranie pracowników
-                    for pracownik in data['pracownicy']:
-                        all_employees.append({
+                    # 2. Adresy
+                    for addr in data['siedziby_adresy']:
+                        all_adresy.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
-                            'Pracownik': pracownik
+                            'Typ Adresu': addr.get('typ', ''),
+                            'Adres': addr.get('content', ''),
+                            'Nr Wpisu': addr.get('nr_wpisu', '')
                         })
                     
-                    # Zbieranie kierownictwa
-                    for kierownik in data['kierownictwo']:
-                        all_management.append({
+                    # 3. Wspólnicy
+                    for wspolnik in data['wspolnicy_akcjonariusze']:
+                        all_wspolnicy.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
-                            'Kierownik': kierownik
+                            'Imiona': wspolnik.get('imiona', ''),
+                            'Nazwisko': wspolnik.get('nazwisko', ''),
+                            'PESEL/REGON': wspolnik.get('pesel_regon', ''),
+                            'Udziały': wspolnik.get('udzialy', ''),
+                            'Procent': wspolnik.get('procent', ''),
+                            'Nr Wpisu': wspolnik.get('nr_wpisu', '')
                         })
                     
-                    # Zbieranie prokurów
+                    # 4. Organy reprezentacji
+                    for organ in data['organy_reprezentacji']:
+                        all_organy_repr.append({
+                            'Numer KRS': data['numer_krs'],
+                            'Nazwa Firmy': data['nazwa_firmy'],
+                            'Imiona': organ.get('imiona', ''),
+                            'Nazwisko': organ.get('nazwisko', ''),
+                            'PESEL/REGON': organ.get('pesel_regon', ''),
+                            'Funkcja': organ.get('funkcja', ''),
+                            'Nr Wpisu': organ.get('nr_wpisu', '')
+                        })
+                    
+                    # 5. Organy nadzoru
+                    for nadzor in data['organy_nadzoru']:
+                        all_organy_nadzoru.append({
+                            'Numer KRS': data['numer_krs'],
+                            'Nazwa Firmy': data['nazwa_firmy'],
+                            'Imiona': nadzor.get('imiona', ''),
+                            'Nazwisko': nadzor.get('nazwisko', ''),
+                            'PESEL/REGON': nadzor.get('pesel_regon', ''),
+                            'Funkcja': nadzor.get('funkcja', ''),
+                            'Nr Wpisu': nadzor.get('nr_wpisu', '')
+                        })
+                    
+                    # 6. Prokurenci
                     for prokurent in data['prokurenci']:
-                        all_attorneys.append({
+                        all_prokurenci.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
-                            'Prokurent': prokurent
+                            'Imiona': prokurent.get('imiona', ''),
+                            'Nazwisko': prokurent.get('nazwisko', ''),
+                            'PESEL/REGON': prokurent.get('pesel_regon', ''),
+                            'Nr Wpisu': prokurent.get('nr_wpisu', '')
                         })
                     
-                    # Zbieranie dat zmian
-                    for data_zmian in data['daty_zmian']:
-                        all_dates.append({
+                    # 7. Działalność
+                    for dzialalnosc in data['przedmiot_dzialalnosci']:
+                        all_dzialalnosc.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
-                            'Data Zmian': data_zmian
+                            'Typ': dzialalnosc.get('typ', ''),
+                            'Zawartość': dzialalnosc.get('content', ''),
+                            'Nr Wpisu': dzialalnosc.get('nr_wpisu', '')
                         })
                     
-                    # Zbieranie zakresu działalności
-                    if data['zakres_działalności']:
-                        all_activities.append({
+                    # 8. Zmiany
+                    for zmiana in data['zestawienie_zmian']:
+                        all_zmiany.append({
                             'Numer KRS': data['numer_krs'],
                             'Nazwa Firmy': data['nazwa_firmy'],
-                            'Zakres Działalności': data['zakres_działalności']
+                            'Nr Wpisu': zmiana.get('nr_wpisu', ''),
+                            'Data': zmiana.get('data', ''),
+                            'Opis': zmiana.get('opis', ''),
+                            'Sygnatura Akt': zmiana.get('sygnatura', ''),
+                            'Sąd': zmiana.get('sad', '')
                         })
                     
                     self.update_status(f"Przetworzono: {Path(pdf_path).name} ({idx+1}/{total_files})", "blue")
@@ -430,66 +621,49 @@ class KRSConverterGUI:
             # Zapis do CSV
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             
-            # 1. Firmy
-            if all_firms:
-                df_firms = pd.DataFrame(all_firms)
-                firms_file = os.path.join(self.output_dir, f"firmy_{timestamp}.csv")
-                df_firms.to_csv(firms_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-            
-            # 2. Pracownicy
-            if all_employees:
-                df_employees = pd.DataFrame(all_employees)
-                employees_file = os.path.join(self.output_dir, f"pracownicy_{timestamp}.csv")
-                df_employees.to_csv(employees_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-            
-            # 3. Kierownictwo
-            if all_management:
-                df_management = pd.DataFrame(all_management)
-                management_file = os.path.join(self.output_dir, f"kierownictwo_{timestamp}.csv")
-                df_management.to_csv(management_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-            
-            # 4. Prokurenci
-            if all_attorneys:
-                df_attorneys = pd.DataFrame(all_attorneys)
-                attorneys_file = os.path.join(self.output_dir, f"prokurenci_{timestamp}.csv")
-                df_attorneys.to_csv(attorneys_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-            
-            # 5. Daty zmian
-            if all_dates:
-                df_dates = pd.DataFrame(all_dates)
-                dates_file = os.path.join(self.output_dir, f"daty_zmian_{timestamp}.csv")
-                df_dates.to_csv(dates_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
-            
-            # 6. Zakresy działalności
-            if all_activities:
-                df_activities = pd.DataFrame(all_activities)
-                activities_file = os.path.join(self.output_dir, f"zakresy_dzialalnosci_{timestamp}.csv")
-                df_activities.to_csv(activities_file, index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_podmioty:
+                pd.DataFrame(all_podmioty).to_csv(os.path.join(self.output_dir, f"podmioty_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_adresy:
+                pd.DataFrame(all_adresy).to_csv(os.path.join(self.output_dir, f"siedziby_adresy_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_wspolnicy:
+                pd.DataFrame(all_wspolnicy).to_csv(os.path.join(self.output_dir, f"wspolnicy_akcjonariusze_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_organy_repr:
+                pd.DataFrame(all_organy_repr).to_csv(os.path.join(self.output_dir, f"organy_reprezentacji_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_organy_nadzoru:
+                pd.DataFrame(all_organy_nadzoru).to_csv(os.path.join(self.output_dir, f"organy_nadzoru_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_prokurenci:
+                pd.DataFrame(all_prokurenci).to_csv(os.path.join(self.output_dir, f"prokurenci_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_dzialalnosc:
+                pd.DataFrame(all_dzialalnosc).to_csv(os.path.join(self.output_dir, f"przedmiot_dzialalnosci_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
+            if all_zmiany:
+                pd.DataFrame(all_zmiany).to_csv(os.path.join(self.output_dir, f"zestawienie_zmian_{timestamp}.csv"), index=False, encoding='utf-8-sig', quoting=csv.QUOTE_ALL)
             
             self.progress.stop()
             self.is_processing = False
             
-            summary = f"""✅ Konwersja zakończona pomyślnie!
+            summary = f"""Konwersja zakończona pomyślnie!
 
 Przetworzono: {len(self.selected_files)} plik(ów)
 
 Utworzone pliki:
-• Firmy: {len(all_firms)} rekordów
-• Pracownicy: {len(all_employees)} rekordów
-• Kierownictwo: {len(all_management)} rekordów
-• Prokurenci: {len(all_attorneys)} rekordów
-• Daty zmian: {len(all_dates)} rekordów
-• Zakresy działalności: {len(all_activities)} rekordów
+• Podmioty: {len(all_podmioty)} rekordów
+• Siedziby/Adresy: {len(all_adresy)} rekordów
+• Wspólnicy/Akcjonariusze: {len(all_wspolnicy)} rekordów
+• Organy Reprezentacji: {len(all_organy_repr)} rekordów
+• Organy Nadzoru: {len(all_organy_nadzoru)} rekordów
+• Prokurenci: {len(all_prokurenci)} rekordów
+• Przedmiot Działalności: {len(all_dzialalnosc)} rekordów
+• Zestawienie Zmian: {len(all_zmiany)} rekordów
 
 Folder: {self.output_dir}"""
             
-            self.update_status("✅ Konwersja zakończona!", "green")
+            self.update_status("Konwersja zakończona!", "green")
             messagebox.showinfo("Sukces", summary)
             
         except Exception as e:
             self.progress.stop()
             self.is_processing = False
-            self.update_status(f"❌ Błąd: {str(e)}", "red")
+            self.update_status(f"Błąd: {str(e)}", "red")
             messagebox.showerror("Błąd", f"Błąd podczas konwersji:\n{str(e)}")
 
 
